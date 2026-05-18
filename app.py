@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -26,7 +27,7 @@ from db import (
 from export_utils import export_results_to_excel
 from extractor import extract_domain
 from serper_client import SerperError, search_dork
-from sheets_sync import push_results_to_sheet
+from url_filters import should_keep_crawl_result, should_skip_url_collection
 
 
 st.set_page_config(page_title="LinkIntel Phase 1", layout="wide")
@@ -47,10 +48,11 @@ async def collect_serper_urls(
     max_pages_per_dork: int,
     results_per_page: int,
     max_urls_total: int,
-    dedupe_mode: str,
 ) -> list[dict[str, str]]:
-    seen: set[str] = set()
+    seen_domains: set[str] = set()
     items: list[dict[str, str]] = []
+    skipped_social = 0
+    skipped_duplicate_domain = 0
 
     for dork in dorks:
         update_dork_status(job_id, dork, "running")
@@ -77,10 +79,14 @@ async def collect_serper_urls(
                 url = normalize_url(str(result.get("link", "")))
                 if not url:
                     continue
-                key = extract_domain(url) if dedupe_mode == "domain" else url.lower()
-                if not key or key in seen:
+                if should_skip_url_collection(url):
+                    skipped_social += 1
                     continue
-                seen.add(key)
+                domain = extract_domain(url)
+                if not domain or domain in seen_domains:
+                    skipped_duplicate_domain += 1
+                    continue
+                seen_domains.add(domain)
                 items.append({"url": url, "dork": dork})
                 if len(items) >= max_urls_total:
                     break
@@ -91,7 +97,11 @@ async def collect_serper_urls(
             update_dork_status(job_id, dork, "limited")
 
     update_job_progress(job_id, total_urls=len(items), status="crawling")
-    add_log(job_id, f"Collected {len(items)} unique URLs after dedupe mode '{dedupe_mode}'.")
+    add_log(
+        job_id,
+        f"Collected {len(items)} URLs (unique domain, no social). "
+        f"Skipped social={skipped_social}, duplicate domain={skipped_duplicate_domain}.",
+    )
     return items
 
 
@@ -102,7 +112,6 @@ async def run_job(
     max_pages_per_dork: int,
     results_per_page: int,
     max_urls_total: int,
-    dedupe_mode: str,
     progress_box: Any,
     logs_box: Any,
 ) -> None:
@@ -114,7 +123,6 @@ async def run_job(
         max_pages_per_dork=max_pages_per_dork,
         results_per_page=results_per_page,
         max_urls_total=max_urls_total,
-        dedupe_mode=dedupe_mode,
     )
     if not items:
         update_job_progress(job_id, status="failed")
@@ -125,6 +133,13 @@ async def run_job(
 
     def on_result(result: dict[str, str]) -> None:
         stats["crawled"] += 1
+        if not should_keep_crawl_result(result):
+            add_log(job_id, f"Filtered: {result['url']} - {result.get('error') or 'social media'}", "INFO")
+            update_job_progress(job_id, crawled_urls=stats["crawled"])
+            render_progress(job_id, progress_box)
+            render_logs(job_id, logs_box)
+            return
+
         if result["status"] == "success":
             stats["success"] += 1
         elif result["status"] in {"failed", "skipped"}:
@@ -211,7 +226,7 @@ with st.sidebar:
     retry_count = st.number_input("retry_count", min_value=0, max_value=5, value=1)
     delay_min = st.number_input("delay_min", min_value=0.0, max_value=60.0, value=0.2, step=0.1)
     delay_max = st.number_input("delay_max", min_value=0.0, max_value=60.0, value=1.5, step=0.1)
-    dedupe_mode = st.selectbox("dedupe_mode", ["url", "domain"])
+    st.caption("Lọc: 1 domain/URL, bỏ mạng xã hội, bỏ HTTP 403/404.")
 
 dorks_raw = st.text_area("Google Dorks (one per line, max 10)", height=180)
 dorks = parse_dorks(dorks_raw)
@@ -250,7 +265,6 @@ if start:
                     int(max_pages_per_dork),
                     int(results_per_page),
                     int(max_urls_total),
-                    dedupe_mode,
                     progress_box,
                     logs_box,
                 )
@@ -267,28 +281,21 @@ if selected_job_id:
 
 render_results(selected_job_id)
 
-st.subheader("Export / Google Sheets")
+st.subheader("Export Excel")
 if selected_job_id is None:
-    st.info("Select a specific job in the sidebar to export or push to Google Sheet.")
+    st.info("Select a specific job in the sidebar to export results.")
 else:
-    export_col, sheet_col = st.columns(2)
-    with export_col:
-        if st.button("Export Excel"):
-            try:
-                filepath = export_results_to_excel(selected_job_id)
-                st.success(f"Exported: {filepath}")
-            except Exception as exc:
-                st.error(f"Export failed: {exc}")
-
-    with sheet_col:
-        with st.form("sheet_form"):
-            spreadsheet_id = st.text_input("Google Sheet ID")
-            worksheet_name = st.text_input("Worksheet name", value=f"job_{selected_job_id}")
-            submitted = st.form_submit_button("Push to Google Sheet")
-        if submitted:
-            try:
-                count = push_results_to_sheet(selected_job_id, spreadsheet_id, worksheet_name)
-                st.success(f"Pushed {count} rows to Google Sheet.")
-            except Exception as exc:
-                add_log(selected_job_id, f"Google Sheet push failed: {exc}", "ERROR")
-                st.error(f"Google Sheet push failed: {exc}")
+    if st.button("Export Excel", key="export_excel"):
+        try:
+            filepath = export_results_to_excel(selected_job_id)
+            with open(filepath, "rb") as excel_file:
+                st.download_button(
+                    label="Download .xlsx",
+                    data=excel_file.read(),
+                    file_name=Path(filepath).name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_excel_{selected_job_id}",
+                )
+            st.success(f"Exported to: {filepath}")
+        except Exception as exc:
+            st.error(f"Export failed: {exc}")

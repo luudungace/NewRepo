@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from config import DATABASE_PATH
+from url_filters import SOCIAL_MEDIA_ROOTS
 
 
 def utc_now() -> str:
@@ -140,7 +141,23 @@ def upsert_result(
         )
 
 
-def _filters(job_id: int | None, search: str | None, status: str | None) -> tuple[str, list[Any]]:
+def _quality_filter_clause() -> tuple[str, list[Any]]:
+    params: list[Any] = []
+    social_parts = ["(domain = ? OR domain LIKE ?)" for _ in SOCIAL_MEDIA_ROOTS]
+    for root in SOCIAL_MEDIA_ROOTS:
+        params.extend([root, f"%.{root}"])
+    social_sql = f"NOT ({' OR '.join(social_parts)})" if social_parts else "1=1"
+    http_sql = "NOT (status = 'failed' AND error IN ('HTTP 403', 'HTTP 404'))"
+    return f"({social_sql} AND {http_sql})", params
+
+
+def _filters(
+    job_id: int | None,
+    search: str | None,
+    status: str | None,
+    *,
+    quality_only: bool = True,
+) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
     if job_id is not None:
@@ -153,6 +170,10 @@ def _filters(job_id: int | None, search: str | None, status: str | None) -> tupl
     if status and status != "all":
         clauses.append("status = ?")
         params.append(status)
+    if quality_only:
+        quality_sql, quality_params = _quality_filter_clause()
+        clauses.append(quality_sql)
+        params.extend(quality_params)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     return where, params
 
@@ -163,8 +184,10 @@ def get_results(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    *,
+    quality_only: bool = True,
 ) -> list[dict[str, Any]]:
-    where, params = _filters(job_id, search, status)
+    where, params = _filters(job_id, search, status, quality_only=quality_only)
     with get_conn() as conn:
         rows = conn.execute(
             f"""
@@ -179,8 +202,14 @@ def get_results(
         return [dict(row) for row in rows]
 
 
-def count_results(job_id: int | None = None, search: str | None = None, status: str | None = None) -> int:
-    where, params = _filters(job_id, search, status)
+def count_results(
+    job_id: int | None = None,
+    search: str | None = None,
+    status: str | None = None,
+    *,
+    quality_only: bool = True,
+) -> int:
+    where, params = _filters(job_id, search, status, quality_only=quality_only)
     with get_conn() as conn:
         return int(conn.execute(f"SELECT COUNT(*) FROM results {where}", params).fetchone()[0])
 
