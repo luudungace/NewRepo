@@ -1,0 +1,11 @@
+streamlit
+aiohttp
+beautifulsoup4
+lxml
+pandas
+openpyxl
+gspread
+google-auth
+python-dotenv
+tldextract
+phonenumbers
